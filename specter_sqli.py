@@ -359,51 +359,110 @@ def make_timing_chart_png(timings, title="Response times"):
     buf.seek(0)
     return buf.read()
 
-def build_html_report(results, outfile=HTML_REPORT_DEFAULT):
-    header = f"<h1>SpecterSqli report</h1><p>Generated: {timestamp()}</p>"
-    sections = [header]
+def build_html_report(results, outfile="specter_report.html"):
+    def badge(text, level):
+        colors = {"high": "red", "medium": "orange", "low": "green"}
+        return f'<span style="color:white;background:{colors[level]};padding:4px 8px;border-radius:6px;">{text}</span>'
 
-    if results.get("boolean_findings"):
-        sections.append("<h2>Boolean findings</h2><ul>")
-        for f in results["boolean_findings"]:
-            sections.append("<li><pre>" + json.dumps(f, indent=2) + "</pre></li>")
-        sections.append("</ul>")
+    html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<title>SpecterSqli Report</title>
+<style>
+body {{
+    font-family: Arial, sans-serif;
+    background: #0f172a;
+    color: #e5e7eb;
+    padding: 20px;
+}}
+h1, h2 {{ color: #38bdf8; }}
+table {{
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 30px;
+}}
+th, td {{
+    border: 1px solid #1e293b;
+    padding: 8px;
+}}
+th {{ background: #1e293b; }}
+tr:nth-child(even) {{ background: #020617; }}
+code {{
+    background: #020617;
+    padding: 4px;
+    border-radius: 4px;
+}}
+.footer {{
+    margin-top: 40px;
+    font-size: 13px;
+    color: #94a3b8;
+}}
+</style>
+</head>
 
-    if results.get("time_findings"):
-        sections.append("<h2>Time-based findings</h2><ul>")
-        for t in results["time_findings"]:
-            sections.append("<li><pre>" + json.dumps(t, indent=2) + "</pre></li>")
-        sections.append("</ul>")
+<body>
+<h1>👻 SpecterSqli Security Report</h1>
+<p>Generated: {timestamp()}</p>
 
-        timings = []
-        for t in results["time_findings"]:
-            label = f"{t.get('param')}|{t.get('db')}"
-            ct = t.get("true_time") or t.get("baseline_time") or 0
-            timings.append({"label": label, "time": ct})
-        if timings:
-            png = make_timing_chart_png(timings, title="True-time per test (s)")
-            b64 = base64.b64encode(png).decode("ascii")
-            sections.append("<h3>Timing chart (true-time)</h3>")
-            sections.append(f'<img src="data:image/png;base64,{b64}" alt="timing chart" />')
+<h2>Boolean SQL Injection Findings</h2>
+<table>
+<tr><th>Parameter</th><th>Payload</th><th>Status</th><th>Risk</th></tr>
+"""
 
-    if results.get("blind"):
-        sections.append("<h2>Blind extraction</h2><pre>" + json.dumps(results["blind"], indent=2) + "</pre>")
+    for f in results.get("boolean_findings", []):
+        risk = badge("LIKELY", "high") if f.get("likely_success") else badge("No", "low")
+        html += f"""
+<tr>
+<td>{f.get("param")}</td>
+<td><code>{f.get("payload")}</code></td>
+<td>{f.get("status")}</td>
+<td>{risk}</td>
+</tr>
+"""
 
-    sections.append("<h2>Defensive guidance</h2><ul>")
-    for s in (
-        "Use parameterized queries / prepared statements.",
-        "Do not reveal DB errors in responses; sanitize/monitor logs.",
-        "Consider WAF rules for known tautologies and time-based probes.",
-        "Rate-limit POST requests and suspicious traffic patterns.",
-        "Log suspicious payloads with source IP and timestamps (redact PII)."
-    ):
-        sections.append("<li>" + s + "</li>")
-    sections.append("</ul>")
+    html += """
+</table>
 
-    html = "<html><body>" + "\n".join(sections) + "</body></html>"
+<h2>Time-Based SQL Injection Findings</h2>
+<table>
+<tr><th>Param</th><th>DB</th><th>True Time</th><th>False Time</th><th>Vulnerable</th></tr>
+"""
+
+    for t in results.get("time_findings", []):
+        risk = badge("YES", "high") if t.get("likely_time_sqli") else badge("NO", "low")
+        html += f"""
+<tr>
+<td>{t.get("param")}</td>
+<td>{t.get("db")}</td>
+<td>{t.get("true_time"):.2f}s</td>
+<td>{t.get("false_time"):.2f}s</td>
+<td>{risk}</td>
+</tr>
+"""
+
+    html += f"""
+</table>
+
+<h2>Blind Extraction Result</h2>
+<pre>{json.dumps(results.get("blind"), indent=2)}</pre>
+
+<div class="footer">
+<hr>
+<p>Tool: <b>SpecterSqli</b></p>
+<p>Author: rhshourav</p>
+<p>Educational & Lab Use Only</p>
+</div>
+
+</body>
+</html>
+"""
+
     with open(outfile, "w") as f:
         f.write(html)
+
     return outfile
+
 
 # ---------- Orchestration per-target ----------
 def analyze_target(url, opts):
