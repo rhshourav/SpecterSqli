@@ -1,58 +1,70 @@
 # 👻 SpecterSqli
 
-**SpecterSqli** is a **lab-focused SQL Injection scanner** designed for learning, CTFs, and defensive understanding.
-It combines **endpoint discovery, parameter enumeration, concurrency, boolean & time-based SQLi detection, blind data extraction, JSON API support, cookie-based sessions, and reporting** in a single Python tool.
+**SpecterSqli** is a **lab-focused SQL Injection analysis tool** designed for **academic projects, security labs, and controlled testing environments**.
+It demonstrates **how SQL injection vulnerabilities are detected, analyzed, reported, and explained** using Python.
 
-> ⚠️ **Legal Notice:**
-> This tool is intended **only for systems you own or have explicit permission to test** (CTFs, labs, training environments).
-> Do **NOT** use against unauthorized targets.
+> ⚠️ **Legal Notice**
+> This tool is intended **only for systems you own or have explicit permission to test**
+> (CTFs, labs, training environments).
+> **Unauthorized use is illegal.**
 
 ---
 
 ## ✍️ Author
 
-**rhshourav**
-Security Learner | Python | Offensive & Defensive Testing
+**RH Shourav**
+Security Learner | Python | Web Application Security
 GitHub: [https://github.com/rhshourav](https://github.com/rhshourav)
 
 ---
 
-## 🚀 Features
+## 🚀 Key Features
 
-* ✅ Automatic **endpoint discovery (crawler)**
-* ✅ GET & POST **parameter discovery**
-* ✅ **Concurrent scanning** of many endpoints
-* ✅ Boolean-based SQL injection testing
-* ✅ Time-based blind SQL injection detection
-* ✅ Blind **per-character data extraction** (lab-only)
-* ✅ JSON API support
-* ✅ Cookie-based authenticated sessions
-* ✅ Vulnerable vs secure backend comparison
-* ✅ HTML report with **response-time charts**
-* ✅ Defensive security guidance in report
-* ✅ Clean CLI interface with `--help`
+* Automatic **HTML form parameter discovery**
+* Supports **GET and POST** endpoints
+* Boolean-based SQL injection detection
+* Time-based blind SQL injection detection
+* Blind **character-by-character data extraction** (lab use only)
+* Optional **authenticated scanning** (login form support)
+* Concurrent scanning of multiple targets
+* **Multi-format reporting**:
+
+  * HTML (default)
+  * JSON
+  * Markdown
+  * Plain Text
+* Detailed findings:
+
+  * Payload used
+  * Evidence
+  * Severity
+  * Impact
+  * Exploitation explanation (educational)
+  * Remediation guidance
 
 ---
 
-## 🧠 What SpecterSqli Teaches You
+## 🧠 Educational Purpose
 
-SpecterSqli is not just a scanner — it helps you learn:
+SpecterSqli is built to help students understand:
 
-* How SQL injection works internally
-* Why **parameterized queries** stop SQLi
-* How time-based attacks bypass error filtering
-* How attackers infer data without visible output
-* How defenders can **detect & mitigate** attacks
+* How SQL injection vulnerabilities arise
+* Why boolean and time-based SQLi work
+* How attackers infer data without error messages
+* How proper defenses stop SQL injection
+* How professional security reports are structured
+
+It focuses on **clarity and explanation**, not aggressive exploitation.
 
 ---
 
 ## 📦 Requirements
 
 * Python **3.8+**
-* Packages:
+* Dependencies:
 
 ```bash
-pip3 install requests beautifulsoup4 matplotlib
+pip install requests beautifulsoup4
 ```
 
 ---
@@ -61,10 +73,11 @@ pip3 install requests beautifulsoup4 matplotlib
 
 ```
 specter_sqli.py
-endpoints.txt        # optional
-cookies.json         # optional
-specter_results.json # auto-generated
-specter_report.html  # auto-generated
+targets.txt          # optional
+specter_report.html  # generated (default)
+specter_report.json  # optional
+specter_report.md    # optional
+specter_report.txt   # optional
 ```
 
 ---
@@ -74,59 +87,45 @@ specter_report.html  # auto-generated
 ### Show help
 
 ```bash
-python3 specter_sqli.py --help
-```
-
-### Scan a single endpoint
-
-```bash
-python3 specter_sqli.py \
-  --target http://10.0.2.15:5000/login.php
-```
-
-### Scan many endpoints concurrently
-
-```bash
-python3 specter_sqli.py \
-  --targets-file endpoints.txt \
-  --concurrency \
-  --workers 8
+python specter_sqli.py --help
 ```
 
 ---
 
-## 🕷️ Automatic Endpoint Discovery (Crawler)
-
-SpecterSqli can crawl a site and discover GET/POST endpoints automatically.
+### Scan a single target (HTML report)
 
 ```bash
-python3 specter_sqli.py \
-  --target http://10.0.2.15:5000 \
-  --crawl \
-  --crawl-depth 2
+python specter_sqli.py \
+  --target http://localhost/login.php
 ```
 
-✔ Extracts links
-✔ Extracts form actions
-✔ Same-host only (safe for labs)
+---
+
+### Scan multiple targets concurrently
+
+```bash
+python specter_sqli.py \
+  --targets-file targets.txt \
+  --concurrency \
+  --workers 6
+```
 
 ---
 
 ## 🔎 Parameter Discovery
 
-The scanner:
+SpecterSqli automatically extracts parameters from:
 
-* Parses HTML forms (`input`, `textarea`, `select`)
-* Extracts URL query parameters
-* Adds common parameter names automatically
+* HTML forms (`input`, `textarea`, `select`)
+* Falls back to common parameters if none are found
 
-This allows scanning even when parameters are unknown.
+This allows scanning even when parameter names are unknown.
 
 ---
 
-## ⚡ Boolean SQL Injection Detection
+## ⚡ Boolean-Based SQL Injection Detection
 
-Tests payloads like:
+Uses logical payloads such as:
 
 ```sql
 ' OR 1=1 -- -
@@ -134,146 +133,115 @@ Tests payloads like:
 
 Detection is based on:
 
-* Response length changes
-* Success keywords
-* SQL error patterns
+* Response length comparison
+* Behavioral differences
+* Reproducible response patterns
 
 ---
 
 ## ⏱️ Time-Based Blind SQL Injection
 
-SpecterSqli detects blind SQLi by measuring response delays using:
-
-* `SLEEP()` (MySQL)
-* `pg_sleep()` (PostgreSQL)
-* `WAITFOR DELAY` (MSSQL)
+Detects blind SQL injection by measuring response delay.
 
 Example:
 
 ```bash
-python3 specter_sqli.py \
-  --target http://10.0.2.15/login.php \
-  --sleep 4
+python specter_sqli.py \
+  --target http://localhost/login.php \
+  --sleep 3
 ```
+
+If response time increases consistently, the parameter is flagged.
 
 ---
 
 ## 🔐 Blind Data Extraction (LAB ONLY)
 
-Extracts data character-by-character using timing inference.
+Extracts data one character at a time using timing inference.
 
 Example (extract database name):
 
 ```bash
-python3 specter_sqli.py \
-  --target http://10.0.2.15/login.php \
-  --blind-extract "SELECT database()" \
+python specter_sqli.py \
+  --target http://localhost/login.php \
+  --blind "SELECT database()" \
   --blind-param username \
   --maxlen 20
 ```
 
-✅ Slow
-✅ No visible output needed
-✅ Educational & powerful
+⚠️ This is **slow by design** and intended **only for learning environments**.
 
 ---
 
-## 🔄 JSON API Support
+## 🔑 Authenticated Scanning (Login Forms)
 
-For REST or SPA backends:
+SpecterSqli can scan protected pages after login.
 
 ```bash
-python3 specter_sqli.py \
-  --target http://10.0.2.15/api/login \
-  --json
-```
-
-Payloads are sent as JSON:
-
-```json
-{
-  "username": "payload",
-  "password": "x"
-}
+python specter_sqli.py \
+  --target http://localhost/dashboard.php \
+  --login-url http://localhost/login.php \
+  --login-user admin \
+  --login-pass password123 \
+  --login-user-field username \
+  --login-pass-field password
 ```
 
 ---
 
-## 🍪 Cookie-Based Sessions
+## 📊 Multi-Format Output (NEW)
 
-For authenticated testing.
+Choose report format using `--output-format`:
 
-### Example cookies.json
+| Format   | Flag             |
+| -------- | ---------------- |
+| HTML     | `html` (default) |
+| JSON     | `json`           |
+| Markdown | `md`             |
+| Text     | `txt`            |
 
-```json
-{
-  "PHPSESSID": "abcdef123456",
-  "sessionid": "xyz987654"
-}
-```
-
-### Use it
+### Examples
 
 ```bash
-python3 specter_sqli.py \
-  --target http://10.0.2.15/dashboard.php \
-  --cookies cookies.json
+python specter_sqli.py --target http://localhost/login.php --output-format json
+python specter_sqli.py --target http://localhost/login.php --output-format md
+python specter_sqli.py --target http://localhost/login.php --output-format txt
 ```
 
 ---
 
-## 📊 HTML Report
+## 🛡️ Defensive Guidance Included
 
-Automatically generated report:
+Each finding explains:
 
-* Boolean findings
-* Time-based results
-* Timing charts
-* Blind extraction output
-* Defensive security guidance
+* Why the vulnerability exists
+* How it can be abused (educational)
+* Real-world impact
+* How to fix it:
 
-```bash
-specter_report.html
-```
+  * Prepared statements
+  * Parameterized queries
+  * Input validation
+  * Least-privilege database access
 
----
-
-## 🆚 Vulnerable vs Secure Comparison
-
-Compare two backends easily:
-
-```bash
-python3 specter_sqli.py \
-  --target http://vulnerable.lab/login.php \
-  --compare http://secure.lab/login.php
-```
+This makes the report suitable for **defensive security learning**.
 
 ---
 
-## 🛡️ Defensive Knowledge (Built-In)
+## ⚠️ Ethical Use Policy
 
-SpecterSqli highlights **why attacks work** and how to stop them:
+Allowed use:
 
-* Prepared statements
-* No error disclosure
-* WAF rules
-* Rate limiting
-* Input validation
+✅ College projects
+✅ Security labs (DVWA, Juice Shop, VulnHub)
+✅ CTFs
+✅ Systems you own
 
-This makes it useful for **defensive security training**.
+Not allowed:
 
----
-
-## ⚠️ Legal & Ethical Notice
-
-This tool is for:
-
-* ✅ CTFs
-* ✅ Labs (DVWA, Juice Shop, VulnHub, TryHackMe)
-* ✅ Systems you own
-
-🚫 Unauthorized scanning is illegal
-🚫 Blind extraction against real systems is harmful
+🚫 Unauthorized scanning
+🚫 Real-world blind extraction
+🚫 Data theft or disruption
 
 You are responsible for how you use this tool.
 
@@ -281,11 +249,12 @@ You are responsible for how you use this tool.
 
 ## ⭐ Final Notes
 
-SpecterSqli was created as:
+SpecterSqli is intentionally:
 
-* A **learning framework**
-* A **research helper**
-* A **training companion**
+* Readable
+* Modular
+* Easy to extend
+* Suitable for academic evaluation
 
-It is intentionally readable, modifiable, and extensible.
+It prioritizes **learning, explanation, and responsible security testing**.
 
