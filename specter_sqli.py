@@ -6,6 +6,7 @@
 import requests
 import argparse
 import time
+import json
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
 
@@ -69,25 +70,23 @@ def boolean_test(session, url, param, timeout):
                 "response_time": r.elapsed.total_seconds()
             },
             "description": (
-                "The application dynamically constructs SQL queries using "
-                "unsanitized user input, allowing logical manipulation of the query."
+                "Unsanitized user input is directly embedded into SQL queries, "
+                "allowing logical manipulation of query conditions."
             ),
             "exploitation": (
-                "In a controlled lab environment, an attacker can alter query "
-                "conditions (TRUE/FALSE) to bypass authentication checks or "
-                "manipulate application logic."
+                "In a lab environment, attackers can modify TRUE/FALSE logic "
+                "to bypass authentication or alter application behavior."
             ),
             "impact": (
-                "This may lead to authentication bypass, unauthorized access, "
-                "or exposure of sensitive database records."
+                "Authentication bypass, unauthorized access, and possible "
+                "data exposure."
             ),
             "severity": "High",
             "remediation": (
-                "Use prepared statements or parameterized queries. "
-                "Avoid string concatenation in SQL and enforce strict input validation."
+                "Use prepared statements, parameterized queries, and strict "
+                "server-side validation."
             )
         })
-
     return findings
 
 # =========================
@@ -110,21 +109,21 @@ def time_test(session, url, param, sleep, timeout):
             "expected_delay": sleep
         },
         "description": (
-            "The database executes injected conditional delays, indicating "
-            "that user input is evaluated as part of a SQL query."
+            "Injected SQL conditions trigger database delays, indicating "
+            "execution of user-controlled input."
         ),
         "exploitation": (
-            "An attacker can infer database values character by character "
-            "by observing response delays, even when no error messages are shown."
+            "Attackers can infer sensitive values by observing response "
+            "time differences, even without visible errors."
         ),
         "impact": (
-            "Sensitive data such as database names, user credentials, "
-            "or configuration values may be extracted silently."
+            "Silent extraction of database names, credentials, or other "
+            "sensitive information."
         ),
         "severity": "Critical" if vulnerable else "Low",
         "remediation": (
-            "Disable stacked queries, use parameterized SQL, "
-            "and implement server-side input validation."
+            "Disable dynamic SQL, use parameterized queries, and apply "
+            "input validation."
         )
     }
 
@@ -154,53 +153,85 @@ def blind_extract_fast(session, url, param, expr, maxlen, sleep, timeout):
     return extracted
 
 # =========================
-# REPORT
+# REPORT GENERATORS
 # =========================
-def build_html_report(results, file):
+def report_html(results):
     html = """
-<html>
-<head>
-<meta charset="utf-8">
-<title>SpecterSqli Final Report</title>
+<html><head><meta charset="utf-8">
+<title>SpecterSqli Report</title>
 <style>
-body { background:#0f172a;color:#e5e7eb;font-family:Arial;padding:20px }
-h1,h2 { color:#f8fafc }
-table { width:100%;border-collapse:collapse;margin-bottom:30px }
-td,th { border:1px solid #1e293b;padding:8px;vertical-align:top }
-th { background:#1e293b }
-pre { white-space:pre-wrap }
-</style>
-</head>
-<body>
+body{background:#0f172a;color:#e5e7eb;font-family:Arial;padding:20px}
+table{width:100%;border-collapse:collapse;margin-bottom:30px}
+td,th{border:1px solid #1e293b;padding:8px;vertical-align:top}
+th{background:#1e293b}
+pre{white-space:pre-wrap}
+</style></head><body>
 <h1>👻 SpecterSqli – SQL Injection Analysis Report</h1>
-<p><b>Author:</b> rhshourav<br>
-<b>Purpose:</b> Educational / College Project</p>
 """
-
     for r in results:
         html += f"<h2>Target: {r['url']}</h2>"
-
         if r.get("blind"):
-            html += f"<p><b>Blind Extracted Data (Lab):</b><pre>{r['blind']}</pre></p>"
-
+            html += f"<p><b>Blind Extracted Data:</b><pre>{r['blind']}</pre></p>"
         for f in r["findings"]:
             html += f"""
 <table>
 <tr><th colspan="2">{f['type']}</th></tr>
-<tr><td><b>Affected Parameter</b></td><td>{f['param']}</td></tr>
-<tr><td><b>Injected Payload</b></td><td><pre>{f['payload']}</pre></td></tr>
-<tr><td><b>Description</b></td><td>{f['description']}</td></tr>
-<tr><td><b>Exploitation Overview</b></td><td>{f['exploitation']}</td></tr>
-<tr><td><b>Impact</b></td><td>{f['impact']}</td></tr>
-<tr><td><b>Severity</b></td><td>{f['severity']}</td></tr>
-<tr><td><b>Evidence</b></td><td><pre>{f['evidence']}</pre></td></tr>
-<tr><td><b>Remediation</b></td><td>{f['remediation']}</td></tr>
+<tr><td>Parameter</td><td>{f['param']}</td></tr>
+<tr><td>Payload</td><td><pre>{f['payload']}</pre></td></tr>
+<tr><td>Description</td><td>{f['description']}</td></tr>
+<tr><td>Exploitation</td><td>{f['exploitation']}</td></tr>
+<tr><td>Impact</td><td>{f['impact']}</td></tr>
+<tr><td>Severity</td><td>{f['severity']}</td></tr>
+<tr><td>Evidence</td><td><pre>{json.dumps(f['evidence'], indent=2)}</pre></td></tr>
+<tr><td>Remediation</td><td>{f['remediation']}</td></tr>
 </table>
 """
-    html += "</body></html>"
+    return html + "</body></html>"
 
-    with open(file, "w", encoding="utf-8") as f:
-        f.write(html)
+def report_markdown(results):
+    md = "# SpecterSqli – SQL Injection Report\n\n"
+    for r in results:
+        md += f"## Target: {r['url']}\n\n"
+        if r.get("blind"):
+            md += f"**Blind Extracted Data:** `{r['blind']}`\n\n"
+        for f in r["findings"]:
+            md += f"""
+### {f['type']}
+- **Parameter:** {f['param']}
+- **Payload:** `{f['payload']}`
+- **Severity:** {f['severity']}
+
+**Description:** {f['description']}
+
+**Exploitation (Lab):** {f['exploitation']}
+
+**Impact:** {f['impact']}
+
+**Evidence:** `{f['evidence']}`
+
+**Remediation:** {f['remediation']}
+
+---
+"""
+    return md
+
+def report_text(results):
+    out = "SpecterSqli – SQL Injection Report\n\n"
+    for r in results:
+        out += f"Target: {r['url']}\n"
+        if r.get("blind"):
+            out += f"Blind Extracted Data: {r['blind']}\n"
+        for f in r["findings"]:
+            out += (
+                f"\n[{f['type']}]\n"
+                f"Param: {f['param']}\n"
+                f"Payload: {f['payload']}\n"
+                f"Severity: {f['severity']}\n"
+                f"Impact: {f['impact']}\n"
+                f"Remediation: {f['remediation']}\n"
+            )
+        out += "\n" + "="*60 + "\n"
+    return out
 
 # =========================
 # ANALYSIS
@@ -210,7 +241,6 @@ def analyze(url, opts):
     session.headers["User-Agent"] = USER_AGENT
 
     authenticated_login(session, opts)
-
     params = discover_params(session, url, opts.timeout)
     findings = []
 
@@ -235,7 +265,7 @@ def analyze(url, opts):
 # CLI
 # =========================
 def main():
-    ap = argparse.ArgumentParser(description="SpecterSqli - College SQLi Project")
+    ap = argparse.ArgumentParser(description="SpecterSqli - College Project")
     ap.add_argument("--target")
     ap.add_argument("--targets-file")
     ap.add_argument("--sleep", type=int, default=2)
@@ -248,7 +278,8 @@ def main():
     ap.add_argument("--login-user-field", default="username")
     ap.add_argument("--login-pass-field", default="password")
     ap.add_argument("--timeout", type=int, default=6)
-    ap.add_argument("--report", default="specter_final_report.html")
+    ap.add_argument("--output-format", choices=["html", "json", "md", "txt"], default="html")
+    ap.add_argument("--report", default="specter_report")
     ap.add_argument("--concurrency", action="store_true")
     ap.add_argument("--workers", type=int, default=6)
 
@@ -260,16 +291,30 @@ def main():
             targets = f.read().splitlines()
     if opts.target:
         targets.append(opts.target)
-    results = []
+
     if opts.concurrency:
         with ThreadPoolExecutor(max_workers=opts.workers) as ex:
             results = list(ex.map(lambda u: analyze(u, opts), targets))
     else:
-        for t in targets:
-            results.append(analyze(t, opts))
+        results = [analyze(t, opts) for t in targets]
 
-    build_html_report(results, opts.report)
-    print("[+] Final report saved:", opts.report)
+    if opts.output_format == "html":
+        content = report_html(results)
+        filename = opts.report + ".html"
+    elif opts.output_format == "json":
+        content = json.dumps(results, indent=2)
+        filename = opts.report + ".json"
+    elif opts.output_format == "md":
+        content = report_markdown(results)
+        filename = opts.report + ".md"
+    else:
+        content = report_text(results)
+        filename = opts.report + ".txt"
+
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    print("[+] Report generated:", filename)
 
 if __name__ == "__main__":
     main()
